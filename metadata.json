@@ -1,0 +1,6 @@
+{
+  "name": "E-Wallet Agent",
+  "description": "A professional fintech Android application mockup for digital wallet agents to perform cash transactions, operators recharge, bill payments, earn commissions, and monitor referrals.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

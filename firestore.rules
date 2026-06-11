@@ -1,0 +1,273 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global default safety net: reject everything
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- REUSABLE SECURITY PRIMITIVES & HELPERS ---
+    
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isEmailVerified() {
+      return request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    // Get the current user register info
+    function getUserRole(uid) {
+      return get(/databases/$(database)/documents/users/$(uid)).data.role;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && (
+        getUserRole(request.auth.uid) == 'admin' ||
+        request.auth.token.email == 'bdwalletagent@gmail.com'
+      );
+    }
+
+    function isAgent() {
+      return isSignedIn() && getUserRole(request.auth.uid) == 'agent';
+    }
+
+    // Retrieves agent model
+    function getAgentData(uid) {
+      return get(/databases/$(database)/documents/agents/$(uid)).data;
+    }
+
+    function isApprovedAgent(uid) {
+      return getAgentData(uid).status == 'approved';
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // --- ENTITY HIGHER-LEVEL SCHEMA VALIDATION ---
+
+    function isValidUser(data) {
+      return data.keys().hasAll(['uid', 'email', 'role', 'createdAt'])
+        && data.keys().size() == 4
+        && data.uid is string && data.uid.size() <= 128
+        && data.email is string && data.email.size() <= 256
+        && data.role in ['admin', 'agent']
+        && data.createdAt is timestamp;
+    }
+
+    function isValidAgent(data) {
+      return data.keys().hasAll(['agentId', 'name', 'mobile', 'status', 'walletBalance', 'referralCode', 'createdAt'])
+        && data.keys().size() == 7
+        && data.agentId is string && data.agentId.size() <= 128
+        && data.name is string && data.name.size() <= 100
+        && data.mobile is string && data.mobile.size() <= 15
+        && data.status in ['pending', 'approved', 'suspended']
+        && data.walletBalance is number && data.walletBalance >= 0
+        && data.referralCode is string && data.referralCode.size() <= 20
+        && data.createdAt is timestamp;
+    }
+
+    function isValidCustomer(data) {
+      return data.keys().hasAll(['id', 'name', 'mobile', 'registeredByAgentId', 'createdAt'])
+        && data.keys().size() == 5
+        && data.id is string && data.id.size() <= 128
+        && data.name is string && data.name.size() <= 100
+        && data.mobile is string && data.mobile.size() <= 15
+        && data.registeredByAgentId == request.auth.uid
+        && data.createdAt is timestamp;
+    }
+
+    function isValidTransaction(data) {
+      return data.keys().hasAll(['id', 'agentId', 'customerMobile', 'type', 'amount', 'commissionEarned', 'status', 'timestamp'])
+        && (data.keys().size() == 8 || (data.keys().hasAll(['operator', 'billType']) && data.keys().size() == 10))
+        && data.id is string && data.id.size() <= 128
+        && data.agentId == request.auth.uid
+        && data.customerMobile is string && data.customerMobile.size() <= 15
+        && data.type in ['deposit', 'withdrawal', 'recharge', 'bill_pay']
+        && data.amount is number && data.amount > 0
+        && data.commissionEarned is number && data.commissionEarned >= 0
+        && data.status in ['pending', 'success', 'failed']
+        && data.timestamp is timestamp;
+    }
+
+    function isValidCommission(data) {
+      return data.keys().hasAll(['id', 'agentId', 'transactionId', 'amount', 'rate', 'timestamp'])
+        && data.keys().size() == 6
+        && data.id is string
+        && data.agentId is string
+        && data.transactionId is string
+        && data.amount is number && data.amount >= 0
+        && data.rate is number && data.rate >= 0
+        && data.timestamp is timestamp;
+    }
+
+    function isValidReferral(data) {
+      return data.keys().hasAll(['id', 'referrerAgentId', 'referredAgentId', 'rewardAmount', 'status', 'timestamp'])
+        && data.keys().size() == 6
+        && data.id is string
+        && data.referrerAgentId is string
+        && data.referredAgentId is string
+        && data.rewardAmount is number && data.rewardAmount >= 0
+        && data.status in ['pending_approval', 'rewarded']
+        && data.timestamp is timestamp;
+    }
+
+
+    // --- PATH ROUTING & ROLE SECURITY CODES ---
+
+    // 1. Users collection
+    match /users/{userId} {
+      allow get: if isSignedIn() && (request.auth.uid == userId || isAdmin());
+      allow list: if isAdmin();
+      
+      // Self registration is allowed, system admin role cannot be self-escalated
+      allow create: if isSignedIn() 
+        && request.auth.uid == userId 
+        && isValidUser(incoming()) 
+        && incoming().role == 'agent'; // Regular users are agents by default, admin is approved server side
+
+      // Role and user records are locked for write, admin can update profiles
+      allow update: if isSignedIn() && (
+        isAdmin() && isValidUser(incoming())
+        || (request.auth.uid == userId && incoming().role == existing().role && isValidUser(incoming()) && incoming().diff(existing()).affectedKeys().hasOnly(['email', 'createdAt']))
+      );
+      
+      allow delete: if isAdmin();
+    }
+
+    // 2. Agents collection
+    match /agents/{agentId} {
+      allow get: if isSignedIn() && (request.auth.uid == agentId || isAdmin());
+      allow list: if isAdmin();
+
+      // Only allow agents to create their own default agent details on signup in pending state
+      allow create: if isSignedIn() 
+        && request.auth.uid == agentId 
+        && isValidAgent(incoming()) 
+        && incoming().status == 'pending' 
+        && incoming().walletBalance == 2000.0; // Gift starting balance or standard trial setup
+
+      // Partition updates to status or wallet transactions
+      allow update: if isSignedIn() && (
+        isAdmin() && isValidAgent(incoming())
+        || (
+          // Self-operation: only allowed if approved agent. Only allowed to change walletBalance (for deposits/withdrawals) and not self-approve or suspended state.
+          request.auth.uid == agentId 
+          && isApprovedAgent(agentId)
+          && incoming().status == existing().status
+          && incoming().referralCode == existing().referralCode
+          && incoming().createdAt == existing().createdAt
+          && isValidAgent(incoming())
+          && incoming().diff(existing()).affectedKeys().hasOnly(['walletBalance', 'name', 'mobile'])
+        )
+      );
+
+      allow delete: if isAdmin();
+    }
+
+    // 3. Customers collection
+    match /customers/{customerId} {
+      allow read: if isSignedIn() && (isAgent() || isAdmin());
+      allow create: if isSignedIn() && isAgent() && isApprovedAgent(request.auth.uid) && isValidId(customerId) && isValidCustomer(incoming());
+      
+      allow update: if isSignedIn() && (
+        isAdmin() && isValidCustomer(incoming())
+        || (
+          isAgent() 
+          && isApprovedAgent(request.auth.uid) 
+          && existing().registeredByAgentId == request.auth.uid
+          && incoming().registeredByAgentId == request.auth.uid
+          && isValidCustomer(incoming())
+          && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'mobile'])
+        )
+      );
+      
+      allow delete: if isAdmin();
+    }
+
+    // 4. Transactions collection
+    match /transactions/{transactionId} {
+      allow get: if isSignedIn() && (isAgent() || isAdmin());
+      allow list: if isSignedIn() && (
+        isAdmin() || (isAgent() && resource.data.agentId == request.auth.uid)
+      );
+
+      // Create transaction requires active and approved status
+      allow create: if isSignedIn() 
+        && isAgent() 
+        && isApprovedAgent(request.auth.uid) 
+        && isValidId(transactionId) 
+        && isValidTransaction(incoming())
+        // Enforce strict commission metrics
+        && (
+          (incoming().type == 'deposit' && incoming().commissionEarned == incoming().amount * 0.05) ||
+          (incoming().type == 'withdrawal' && incoming().commissionEarned == incoming().amount * 0.03) ||
+          (incoming().type != 'deposit' && incoming().type != 'withdrawal' && incoming().commissionEarned == 0)
+        )
+        && incoming().timestamp == request.time;
+
+      // Status immutable lock exception: Admins can update transactions (e.g. resolve disputes)
+      allow update: if isAdmin() && isValidTransaction(incoming());
+      allow delete: if isAdmin();
+    }
+
+    // 5. Commissions collection
+    match /commissions/{commissionId} {
+      allow read: if isSignedIn() && (
+        isAdmin() || (isAgent() && resource.data.agentId == request.auth.uid)
+      );
+      
+      // Commissions are generated strictly server-side or during atomicity success audits. Admins can manage.
+      allow create: if isAdmin() || (
+        isSignedIn() && isAgent() && isApprovedAgent(request.auth.uid) 
+        && isValidId(commissionId) 
+        && isValidCommission(incoming())
+        && incoming().agentId == request.auth.uid
+        && incoming().timestamp == request.time
+      );
+      
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    // 6. Referrals collection
+    match /referrals/{referralId} {
+      allow read: if isSignedIn() && (
+        isAdmin() || (isAgent() && (resource.data.referrerAgentId == request.auth.uid || resource.data.referredAgentId == request.auth.uid))
+      );
+      
+      allow create: if isSignedIn() && isAgent() && isApprovedAgent(request.auth.uid) 
+        && isValidId(referralId) 
+        && isValidReferral(incoming())
+        && incoming().referrerAgentId == request.auth.uid
+        && incoming().referrerAgentId != incoming().referredAgentId; // Prevent self-referral loop
+        
+      allow update: if isAdmin() && isValidReferral(incoming());
+      allow delete: if isAdmin();
+    }
+
+    // 7. Notifications collection
+    match /notifications/{notificationId} {
+      allow read: if isSignedIn() && (
+        isAdmin() || 
+        resource.data.type == 'broadcast' || 
+        (resource.data.type == 'individual' && resource.data.recipientAgentId == request.auth.uid)
+      );
+
+      // Creating messages is reserved strictly for system broadcasts (Admins)
+      allow create: if isAdmin();
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+  }
+}
